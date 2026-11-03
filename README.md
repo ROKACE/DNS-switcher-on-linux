@@ -1,0 +1,1 @@
+# DNS-switcher-on-linux
