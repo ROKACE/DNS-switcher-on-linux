@@ -2,8 +2,6 @@
 
 A single-file POSIX shell script for switching, testing, and restoring the system DNS resolver on Linux desktops: [ROKACE/DNS-switcher-on-linux](https://github.com/ROKACE/DNS-switcher-on-linux).
 
-## Quick start (copy and paste)
-
 Linux only. Copy the line below, paste it into a terminal, enter your password —
 the interactive menu opens:
 
@@ -11,7 +9,7 @@ the interactive menu opens:
 curl -fsSL -o /tmp/dns-switcher.sh https://raw.githubusercontent.com/ROKACE/DNS-switcher-on-linux/main/dns-switcher.sh && sudo sh /tmp/dns-switcher.sh
 ```
 
-No `curl`? Use `wget`:
+Use `wget`:
 
 ```sh
 wget -qO /tmp/dns-switcher.sh https://raw.githubusercontent.com/ROKACE/DNS-switcher-on-linux/main/dns-switcher.sh && sudo sh /tmp/dns-switcher.sh
