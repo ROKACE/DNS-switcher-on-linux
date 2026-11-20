@@ -1,0 +1,3 @@
+# A CRLF shebang breaks the script on Linux, so keep the working tree LF-only
+# even on Windows checkouts (core.autocrlf=true).
+* text=auto eol=lf

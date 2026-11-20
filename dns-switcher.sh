@@ -27,11 +27,13 @@
 #
 #  Run as root.  Usage: dns-switcher.sh [options]   (see --help)
 #
-#  License: MIT
+#  License: MIT -- see LICENSE
+#  SPDX-License-Identifier: MIT
+#  Copyright (c) 2026 DNS-switcher-on-linux contributors
 # =============================================================================
 
 APP="dns-switcher"
-APP_VERSION="1.0.0"
+APP_VERSION="1.1.0"
 
 # --- filesystem layout -------------------------------------------------------
 STATE_DIR="/etc/$APP"
@@ -84,6 +86,19 @@ DO_SELFTEST=0
 TEST_KEY=""
 SNAPSHOT_ACTIVE="no"
 
+# --- behaviour flags ---------------------------------------------------------
+BACKEND_REQ="auto"      # auto | resolved | file
+BACKEND=""              # effective backend, chosen by resolve_backend()
+APPLIED_VIA=""          # resolved | proxy | file, set by the apply_* helpers
+DRY_RUN="no"
+PURGE="no"
+FORCE="no"
+DO_HEALTH=0
+DO_JSON="no"
+DO_UNINSTALL=0
+FILE_CHANGED="no"
+VERIFY_TIMEOUT="2"
+
 # provider fields (set by provider_load)
 P_NAME=""; P_PROFILE=""; P_V4=""; P_V6=""; P_DOT=""; P_DOH=""; P_DOQ=""; P_SDNS=""
 
@@ -126,6 +141,65 @@ confirm() {
 
 have() { command -v "$1" >/dev/null 2>&1; }
 is_root() { [ "$(id -u 2>/dev/null)" = "0" ]; }
+
+# =============================================================================
+#  Planned changes and idempotent file writing
+# =============================================================================
+plan() { printf '  %b[dry-run]%b %s\n' "$C_CYAN" "$C_RESET" "$1"; }
+
+# Temporary path used to render a file before it is compared with its target.
+# In dry-run mode the temporary file never sits next to the target, so a
+# non-root check run does not need write access to /etc.
+tmp_for() {
+    if [ "$DRY_RUN" = "yes" ]; then
+        printf '%s/%s.$$.tmp' "${TMPDIR:-/tmp}" "$APP"
+    else
+        printf '%s.new.$$' "$1"
+    fi
+}
+
+# commit_file <temp> <target> <mode>
+# Compares the rendered content with the target and only moves it into place
+# when it differs.  Sets FILE_CHANGED=yes/no so callers can skip service
+# restarts.  In dry-run mode nothing is written, only the plan is printed.
+commit_file() {
+    FILE_CHANGED="yes"
+    if have cmp && [ -f "$2" ] && cmp -s "$1" "$2"; then
+        FILE_CHANGED="no"
+        rm -f "$1" 2>/dev/null
+        return 0
+    fi
+    if [ "$DRY_RUN" = "yes" ]; then
+        plan "would write $2"
+        rm -f "$1" 2>/dev/null
+        return 0
+    fi
+    if ! mv -f "$1" "$2" 2>/dev/null; then
+        rm -f "$1" 2>/dev/null
+        err "Cannot write $2"
+        return 1
+    fi
+    chmod "$3" "$2" 2>/dev/null
+    return 0
+}
+
+# True when /etc/resolv.conf can be replaced.  Catches the three cases that
+# otherwise produce a bare "Operation not permitted": a bind-mounted file
+# (containers), a read-only filesystem and the immutable attribute.
+resolv_conf_writable() {
+    [ -e "$RESOLV_CONF" ] || return 0
+    [ -w "$RESOLV_CONF" ] || return 1
+    if have mountpoint && mountpoint -q "$RESOLV_CONF" 2>/dev/null; then
+        return 1
+    fi
+    if have lsattr; then
+        _attr=$(lsattr -d "$RESOLV_CONF" 2>/dev/null | awk '{print $1}')
+        case "$_attr" in
+            *i*|*a*) return 1 ;;
+        esac
+    fi
+    return 0
+}
 
 require_root() {
     is_root && return 0
@@ -289,6 +363,44 @@ detect_all() {
     detect_init
     detect_resolver
     detect_ipv6
+}
+
+# systemd-resolved is only usable when its stub listener is enabled: libc
+# reaches it through /run/systemd/resolve/stub-resolv.conf, so with
+# DNSStubListener=no the resolver is active but useless for the system.
+resolved_stub_available() {
+    [ -e /run/systemd/resolve/stub-resolv.conf ]
+}
+
+# Decides where the resolver configuration is written.  'auto' keeps the
+# historical behaviour but degrades to the plain file when the resolved stub
+# listener is disabled, instead of failing the whole apply.
+resolve_backend() {
+    BACKEND="file"
+    if [ "$RESOLVER" = "resolved" ] && have systemctl && resolved_stub_available; then
+        BACKEND="resolved"
+    fi
+    case "$BACKEND_REQ" in
+        auto) : ;;
+        resolved)
+            if [ "$RESOLVER" != "resolved" ]; then
+                die "--backend resolved requested, but systemd-resolved is not the active resolver (detected: $RESOLVER). Use --backend file."
+            fi
+            if ! resolved_stub_available; then
+                die "--backend resolved requested, but /run/systemd/resolve/stub-resolv.conf is missing (systemd-resolved runs with DNSStubListener=no). Use --backend file."
+            fi
+            if ! have systemctl; then
+                die "--backend resolved requested, but systemctl is not available. Use --backend file."
+            fi
+            BACKEND="resolved"
+            ;;
+        file)
+            BACKEND="file"
+            ;;
+        *)
+            die "Unknown backend '$BACKEND_REQ' (valid: auto, resolved, file)"
+            ;;
+    esac
 }
 
 # =============================================================================
@@ -758,7 +870,13 @@ snapshot_restore() {
         have systemctl && systemctl reload-or-try-restart NetworkManager >/dev/null 2>&1
     fi
     SNAPSHOT_ACTIVE="no"
-    warn "Previous DNS configuration restored."
+    APPLIED_VIA=""
+    if verify_resolution >/dev/null 2>&1; then
+        warn "Previous DNS configuration restored."
+    else
+        warn "The previous files were restored, but name resolution still fails."
+        warn "Check $RESOLV_CONF and the resolver service manually."
+    fi
     return 0
 }
 
@@ -774,6 +892,10 @@ resolved_ensure_running() {
     if have systemctl && systemctl is-active --quiet systemd-resolved 2>/dev/null; then
         return 0
     fi
+    if [ "$DRY_RUN" = "yes" ]; then
+        plan "would enable and start systemd-resolved"
+        return 0
+    fi
     if have systemctl; then
         systemctl enable --now systemd-resolved >/dev/null 2>&1
         systemctl is-active --quiet systemd-resolved 2>/dev/null && return 0
@@ -786,35 +908,71 @@ resolved_ensure_running() {
 resolved_ensure_stub_symlink() {
     _stub="/run/systemd/resolve/stub-resolv.conf"
     if [ ! -e "$_stub" ]; then
-        warn "systemd-resolved stub resolver not found at $_stub."
+        err "systemd-resolved stub resolver not found at $_stub (DNSStubListener=no?)."
         return 1
-    fi
-    ensure_dirs
-    if { [ -e "$RESOLV_CONF" ] || [ -L "$RESOLV_CONF" ]; } \
-        && [ ! -e "$BACKUP_DIR/resolv.conf.pre-resolved" ]; then
-        cp -a "$RESOLV_CONF" "$BACKUP_DIR/resolv.conf.pre-resolved" 2>/dev/null
     fi
     if [ -L "$RESOLV_CONF" ] \
         && [ "$(readlink "$RESOLV_CONF" 2>/dev/null)" = "$_stub" ]; then
         return 0
     fi
+    if [ "$DRY_RUN" = "yes" ]; then
+        plan "would point $RESOLV_CONF at $_stub"
+        return 0
+    fi
+    resolv_conf_writable || {
+        err "$RESOLV_CONF cannot be replaced (bind-mounted, read-only or immutable)."
+        err "Point it at $_stub manually, or use --backend file on a host that owns the file."
+        return 1
+    }
+    ensure_dirs
+    if { [ -e "$RESOLV_CONF" ] || [ -L "$RESOLV_CONF" ]; } \
+        && [ ! -e "$BACKUP_DIR/resolv.conf.pre-resolved" ]; then
+        cp -a "$RESOLV_CONF" "$BACKUP_DIR/resolv.conf.pre-resolved" 2>/dev/null
+    fi
     rm -f "$RESOLV_CONF"
-    ln -s "$_stub" "$RESOLV_CONF" 2>/dev/null || return 1
+    ln -s "$_stub" "$RESOLV_CONF" 2>/dev/null || {
+        err "Cannot create the symlink $RESOLV_CONF"
+        return 1
+    }
     return 0
 }
 
 # $1 = DNS server list, $2 = yes/no for DNSOverTLS
+resolved_dropin_content() {
+    printf '# Generated by %s. Do not edit manually.\n' "$APP"
+    printf '[Resolve]\n'
+    printf 'DNS=%s\n' "$1"
+    printf 'DNSOverTLS=%s\n' "$2"
+    printf 'Domains=~.\n'
+    printf 'FallbackDNS=\n'
+}
+
 resolved_write() {
-    mkdir -p "$RESOLVED_DROPIN_DIR" 2>/dev/null || return 1
+    if [ "$DRY_RUN" != "yes" ]; then
+        mkdir -p "$RESOLVED_DROPIN_DIR" 2>/dev/null || {
+            err "Cannot create $RESOLVED_DROPIN_DIR"
+            return 1
+        }
+    fi
     resolved_ensure_stub_symlink || return 1
-    {
-        printf '# Generated by %s on %s. Do not edit manually.\n' "$APP" "$(date -u '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null)"
-        printf '[Resolve]\n'
-        printf 'DNS=%s\n' "$1"
-        printf 'DNSOverTLS=%s\n' "$2"
-        printf 'Domains=~.\n'
-        printf 'FallbackDNS=\n'
-    } > "$RESOLVED_DROPIN" || return 1
+    _out=$(tmp_for "$RESOLVED_DROPIN")
+    resolved_dropin_content "$1" "$2" > "$_out" || {
+        rm -f "$_out"
+        err "Cannot render $RESOLVED_DROPIN"
+        return 1
+    }
+    commit_file "$_out" "$RESOLVED_DROPIN" 0644 || return 1
+    if [ "$FILE_CHANGED" = "no" ] && [ "$FORCE" != "yes" ]; then
+        RESOLVER="resolved"
+        msg "systemd-resolved is already configured this way - not restarting it."
+        return 0
+    fi
+    if [ "$DRY_RUN" = "yes" ]; then
+        plan "would restart systemd-resolved"
+        RESOLVER="resolved"
+        return 0
+    fi
+    have resolvectl && resolvectl flush-caches >/dev/null 2>&1
     systemctl restart systemd-resolved >/dev/null 2>&1 || {
         err "Cannot restart systemd-resolved."
         return 1
@@ -830,6 +988,10 @@ resolved_write() {
 
 resolved_clear() {
     if [ -f "$RESOLVED_DROPIN" ]; then
+        if [ "$DRY_RUN" = "yes" ]; then
+            plan "would remove $RESOLVED_DROPIN"
+            return 0
+        fi
         rm -f "$RESOLVED_DROPIN"
         systemctl restart systemd-resolved >/dev/null 2>&1
         have resolvectl && resolvectl flush-caches >/dev/null 2>&1
@@ -840,11 +1002,19 @@ resolved_clear() {
 #  NetworkManager / plain file backend
 # =============================================================================
 file_backup_resolv() {
+    [ "$DRY_RUN" = "yes" ] && return 0
     ensure_dirs
     if [ ! -e "$RESOLV_BACKUP" ] && [ ! -L "$RESOLV_BACKUP" ] \
         && { [ -e "$RESOLV_CONF" ] || [ -L "$RESOLV_CONF" ]; }; then
         cp -a "$RESOLV_CONF" "$RESOLV_BACKUP" 2>/dev/null
     fi
+}
+
+nm_conf_content() {
+    printf '# Generated by %s: keep NetworkManager from overwriting %s\n' "$APP" "$RESOLV_CONF"
+    printf '[main]\n'
+    printf 'dns=none\n'
+    printf 'rc-manager=unmanaged\n'
 }
 
 nm_disable_management() {
@@ -853,13 +1023,20 @@ nm_disable_management() {
         networkmanager|file) : ;;
         *) return 0 ;;
     esac
-    mkdir -p "$(dirname "$NM_CONF")" 2>/dev/null
-    {
-        printf '# Generated by %s: keep NetworkManager from overwriting %s\n' "$APP" "$RESOLV_CONF"
-        printf '[main]\n'
-        printf 'dns=none\n'
-        printf 'rc-manager=unmanaged\n'
-    } > "$NM_CONF"
+    if [ "$DRY_RUN" != "yes" ]; then
+        mkdir -p "$(dirname "$NM_CONF")" 2>/dev/null
+    fi
+    _out=$(tmp_for "$NM_CONF")
+    nm_conf_content > "$_out" || {
+        rm -f "$_out"
+        return 0
+    }
+    commit_file "$_out" "$NM_CONF" 0644 || return 0
+    [ "$FILE_CHANGED" = "no" ] && return 0
+    if [ "$DRY_RUN" = "yes" ]; then
+        plan "would reload NetworkManager"
+        return 0
+    fi
     systemctl reload NetworkManager >/dev/null 2>&1
 }
 
@@ -869,27 +1046,46 @@ nm_restore_management() {
 }
 
 # $@ = nameserver addresses
+file_resolv_content() {
+    printf '# Generated by %s\n' "$APP"
+    for _ns in "$@"; do
+        [ -n "$_ns" ] && printf 'nameserver %s\n' "$_ns"
+    done
+    printf 'options timeout:2 attempts:2\n'
+}
+
 file_write_resolv() {
     file_backup_resolv
-    # Drop a symlink (e.g. the resolved stub) so our content actually sticks.
-    if [ -L "$RESOLV_CONF" ]; then
-        rm -f "$RESOLV_CONF"
+    if ! resolv_conf_writable; then
+        if [ "$DRY_RUN" = "yes" ]; then
+            plan "$RESOLV_CONF is not writable - a real apply would fail here"
+        else
+            err "$RESOLV_CONF cannot be written (bind-mounted, read-only or immutable)."
+            err "This is typical inside containers; run the script on the host instead."
+            return 1
+        fi
     fi
-    {
-        printf '# Generated by %s on %s\n' "$APP" "$(date -u '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null)"
-        for _ns in "$@"; do
-            [ -n "$_ns" ] && printf 'nameserver %s\n' "$_ns"
-        done
-        printf 'options timeout:2 attempts:2\n'
-    } > "$RESOLV_CONF" || return 1
-    chmod 0644 "$RESOLV_CONF" 2>/dev/null
+    _out=$(tmp_for "$RESOLV_CONF")
+    file_resolv_content "$@" > "$_out" || {
+        rm -f "$_out"
+        err "Cannot render $RESOLV_CONF"
+        return 1
+    }
+    commit_file "$_out" "$RESOLV_CONF" 0644 || return 1
+    if [ "$FILE_CHANGED" = "no" ]; then
+        msg "$RESOLV_CONF is already up to date."
+    fi
     return 0
 }
 
 # =============================================================================
-#  Local proxy service management (systemd / OpenRC / background fallback)
+#  Local proxy service management (systemd / OpenRC)
 # =============================================================================
 svc_stop() {
+    if [ "$DRY_RUN" = "yes" ]; then
+        plan "would stop and disable the $APP service"
+        return 0
+    fi
     case "$INIT_SYS" in
         systemd)
             systemctl stop "$APP" >/dev/null 2>&1
@@ -900,58 +1096,99 @@ svc_stop() {
             rc-update del "$APP" default >/dev/null 2>&1
             ;;
     esac
-    if [ -f "$STATE_DIR/pid" ]; then
-        _p=$(cat "$STATE_DIR/pid" 2>/dev/null)
-        if [ -n "$_p" ]; then
-            kill "$_p" >/dev/null 2>&1
-        fi
-        rm -f "$STATE_DIR/pid"
-    fi
+}
+
+# The unit is deliberately hardened: the proxy only binds port 53 and never
+# writes to the filesystem, so root is not needed for anything else.
+unit_content() {
+    printf '[Unit]\n'
+    printf 'Description=%s local DNS proxy (AdGuard dnsproxy)\n' "$APP"
+    printf 'After=network-online.target\n'
+    printf 'Wants=network-online.target\n'
+    printf 'Before=nss-lookup.target\n'
+    printf 'StartLimitIntervalSec=30\n'
+    printf 'StartLimitBurst=5\n\n'
+    printf '[Service]\n'
+    printf 'Type=simple\n'
+    printf 'ExecStart=%s %s\n' "$DNSPROXY_RESOLVED" "$1"
+    printf 'Restart=always\n'
+    printf 'RestartSec=2\n'
+    printf 'LimitNOFILE=8192\n'
+    printf 'CapabilityBoundingSet=CAP_NET_BIND_SERVICE\n'
+    printf 'AmbientCapabilities=CAP_NET_BIND_SERVICE\n'
+    printf 'NoNewPrivileges=yes\n'
+    printf 'PrivateTmp=yes\n'
+    printf 'PrivateDevices=yes\n'
+    printf 'ProtectSystem=strict\n'
+    printf 'ProtectHome=yes\n'
+    printf 'ProtectKernelTunables=yes\n'
+    printf 'ProtectKernelModules=yes\n'
+    printf 'ProtectControlGroups=yes\n'
+    printf 'RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK\n'
+    printf 'LockPersonality=yes\n\n'
+    printf '[Install]\n'
+    printf 'WantedBy=multi-user.target\n'
 }
 
 svc_write_systemd_unit() {
     # $1 = arguments (without the binary path)
-    {
-        printf '[Unit]\n'
-        printf 'Description=%s local DNS proxy (AdGuard dnsproxy)\n' "$APP"
-        printf 'After=network-online.target nss-lookup.target\n'
-        printf 'Wants=network-online.target\n'
-        printf 'Before=nss-lookup.target\n\n'
-        printf '[Service]\n'
-        printf 'Type=simple\n'
-        printf 'ExecStart=%s %s\n' "$DNSPROXY_RESOLVED" "$1"
-        printf 'Restart=on-failure\n'
-        printf 'RestartSec=2\n'
-        printf 'LimitNOFILE=8192\n\n'
-        printf '[Install]\n'
-        printf 'WantedBy=multi-user.target\n'
-    } > "$SYSTEMD_UNIT" || return 1
+    _out=$(tmp_for "$SYSTEMD_UNIT")
+    unit_content "$1" > "$_out" || {
+        rm -f "$_out"
+        err "Cannot render $SYSTEMD_UNIT"
+        return 1
+    }
+    commit_file "$_out" "$SYSTEMD_UNIT" 0644 || return 1
+    [ "$FILE_CHANGED" = "no" ] && return 0
+    if [ "$DRY_RUN" = "yes" ]; then
+        plan "would run systemctl daemon-reload"
+        return 0
+    fi
     systemctl daemon-reload >/dev/null 2>&1
     return 0
 }
 
+openrc_content() {
+    printf '#!/sbin/openrc-run\n'
+    printf 'name="%s"\n' "$APP"
+    printf 'description="Local DNS proxy (AdGuard dnsproxy)"\n'
+    printf 'command="%s"\n' "$DNSPROXY_RESOLVED"
+    printf 'command_args="%s"\n' "$1"
+    printf 'command_background="yes"\n'
+    printf 'pidfile="/run/%s.pid"\n' "$APP"
+    printf 'depend() { need net; after firewall; use dns logger; }\n'
+}
+
 svc_write_openrc_script() {
     # $1 = arguments (without the binary path)
-    {
-        printf '#!/sbin/openrc-run\n'
-        printf 'name="%s"\n' "$APP"
-        printf 'description="Local DNS proxy (AdGuard dnsproxy)"\n'
-        printf 'command="%s"\n' "$DNSPROXY_RESOLVED"
-        printf 'command_args="%s"\n' "$1"
-        printf 'command_background="yes"\n'
-        printf 'pidfile="/run/%s.pid"\n' "$APP"
-        printf 'depend() { need net; after firewall; use dns logger; }\n'
-    } > "$OPENRC_INIT" || return 1
-    chmod 0755 "$OPENRC_INIT"
+    _out=$(tmp_for "$OPENRC_INIT")
+    openrc_content "$1" > "$_out" || {
+        rm -f "$_out"
+        err "Cannot render $OPENRC_INIT"
+        return 1
+    }
+    commit_file "$_out" "$OPENRC_INIT" 0755 || return 1
     return 0
 }
 
-# Install and (re)start the proxy with the given dnsproxy arguments.
+# Install and (re)start the proxy with the given dnsproxy arguments.  When the
+# unit is already identical and the service is running, nothing is restarted,
+# so repeated provisioning runs do not interrupt name resolution.
 svc_install_and_start() {
     _args="$1"
     case "$INIT_SYS" in
         systemd)
             svc_write_systemd_unit "$_args" || return 1
+            _changed="$FILE_CHANGED"
+            if [ "$_changed" = "no" ] && [ "$FORCE" != "yes" ] \
+                && systemctl is-active --quiet "$APP" 2>/dev/null; then
+                msg "The proxy service is already running with this configuration."
+                return 0
+            fi
+            if [ "$DRY_RUN" = "yes" ]; then
+                plan "would enable and restart $APP.service"
+                return 0
+            fi
             systemctl enable "$APP" >/dev/null 2>&1
             if ! systemctl restart "$APP" >/dev/null 2>&1; then
                 systemctl status "$APP" --no-pager -l 2>&1 | tail -n 12 >&2
@@ -963,6 +1200,16 @@ svc_install_and_start() {
             ;;
         openrc)
             svc_write_openrc_script "$_args" || return 1
+            _changed="$FILE_CHANGED"
+            if [ "$_changed" = "no" ] && [ "$FORCE" != "yes" ] \
+                && rc-service "$APP" status >/dev/null 2>&1; then
+                msg "The proxy service is already running with this configuration."
+                return 0
+            fi
+            if [ "$DRY_RUN" = "yes" ]; then
+                plan "would enable and restart $APP (OpenRC)"
+                return 0
+            fi
             rc-update add "$APP" default >/dev/null 2>&1
             if ! rc-service "$APP" restart >/dev/null 2>&1; then
                 rc-update del "$APP" default >/dev/null 2>&1
@@ -979,6 +1226,10 @@ svc_install_and_start() {
 }
 
 svc_remove_unit() {
+    if [ "$DRY_RUN" = "yes" ]; then
+        plan "would stop and remove the $APP service file"
+        return 0
+    fi
     svc_stop
     rm -f "$SYSTEMD_UNIT" "$OPENRC_INIT" 2>/dev/null
     have systemctl && systemctl daemon-reload >/dev/null 2>&1
@@ -1085,15 +1336,17 @@ apply_plain() {
 
     svc_remove_unit
     msg "Configuring plain DNS: $_list"
-    case "$RESOLVER" in
+    case "$BACKEND" in
         resolved)
             resolved_ensure_running || die "systemd-resolved is not available."
             resolved_write "$_list" "no" || return 1
+            APPLIED_VIA="resolved"
             ;;
         *)
             nm_disable_management
             # shellcheck disable=SC2086
             file_write_resolv $_list || return 1
+            APPLIED_VIA="file"
             ;;
     esac
     MODE_USED="plain"
@@ -1102,7 +1355,8 @@ apply_plain() {
 
 apply_dot() {
     [ -n "$P_DOT" ] || die "Provider '$P_KEY' does not publish a DoT hostname."
-    if [ "$INIT_SYS" = "systemd" ] && resolved_available && resolved_ensure_running; then
+    if [ "$BACKEND" = "resolved" ] && [ "$INIT_SYS" = "systemd" ] \
+        && resolved_available && resolved_ensure_running; then
         _list=""
         for _ip in $(csv "$P_V4"); do _list="$_list $_ip#$P_DOT"; done
         if [ "$HAS_IPV6" = "yes" ]; then
@@ -1116,12 +1370,35 @@ apply_dot() {
         svc_remove_unit
         msg "Enabling DNS-over-TLS through systemd-resolved (strict): $P_DOT"
         resolved_write "$_list" "yes" || return 1
+        APPLIED_VIA="resolved"
     else
         service_supported || die "DNS-over-TLS via dnsproxy requires systemd or OpenRC; plain DNS still works."
-        msg "systemd-resolved is unavailable - DoT will be provided by dnsproxy."
+        msg "DoT will be provided by dnsproxy on $PROXY_LISTEN:$PROXY_PORT."
         apply_proxy "tls://$P_DOT" || return 1
+        APPLIED_VIA="proxy"
     fi
     MODE_USED="dot"
+    return 0
+}
+
+# True when the service is running and its unit already describes exactly
+# these dnsproxy arguments, so a re-apply does not have to restart it.
+proxy_already_running() {
+    _want="$1"
+    [ "$FORCE" = "yes" ] && return 1
+    case "$INIT_SYS" in
+        systemd)
+            [ -f "$SYSTEMD_UNIT" ] || return 1
+            systemctl is-active --quiet "$APP" 2>/dev/null || return 1
+            unit_content "$_want" | cmp -s - "$SYSTEMD_UNIT" 2>/dev/null || return 1
+            ;;
+        openrc)
+            [ -f "$OPENRC_INIT" ] || return 1
+            rc-service "$APP" status >/dev/null 2>&1 || return 1
+            openrc_content "$_want" | cmp -s - "$OPENRC_INIT" 2>/dev/null || return 1
+            ;;
+        *) return 1 ;;
+    esac
     return 0
 }
 
@@ -1131,31 +1408,59 @@ apply_proxy() {
     _up="$1"
     _extra="${2:-}"
     service_supported || die "Encrypted DNS requires systemd or OpenRC. Plain DNS (--mode plain) still works."
-    ensure_dnsproxy
-    svc_remove_unit
-    if _holders=$(port53_busy); then
-        err "Port 53 is already in use:"
-        printf '%s\n' "$_holders" >&2
-        die "Stop the service that holds port 53, or use --mode plain."
+    if [ "$DRY_RUN" = "yes" ]; then
+        plan "would proxy DNS through $_up"
+        if [ -n "${DNSPROXY_OVERRIDE:-}" ] && [ -x "$DNSPROXY_OVERRIDE" ]; then
+            plan "would use dnsproxy at $DNSPROXY_OVERRIDE"
+        elif [ -x "$DNSPROXY_BIN" ] || have dnsproxy; then
+            plan "would use the existing dnsproxy binary"
+        else
+            plan "would install dnsproxy $DNSPROXY_VERSION to $DNSPROXY_BIN"
+        fi
+        if _holders=$(port53_busy); then
+            err "Port 53 is already in use, a real apply would refuse to continue:"
+            printf '%s\n' "$_holders" >&2
+            return 1
+        fi
+        plan "would start $APP on $PROXY_LISTEN:$PROXY_PORT"
+        if [ "$BACKEND" = "resolved" ]; then
+            plan "would point systemd-resolved at $PROXY_LISTEN"
+        else
+            plan "would write $RESOLV_CONF (nameserver $PROXY_LISTEN) and disable NetworkManager DNS management"
+        fi
+        APPLIED_VIA="proxy"
+        return 0
     fi
+    ensure_dnsproxy
     _bs=$(bootstrap_args)
     _args="-l $PROXY_LISTEN -p $PROXY_PORT -u $_up$_bs --cache --timeout=5s"
     [ -n "$_extra" ] && _args="$_args $_extra"
-    msg "Starting the local DNS proxy on $PROXY_LISTEN:$PROXY_PORT ..."
-    if ! svc_install_and_start "$_args"; then
-        err "Failed to start the local DNS proxy (see: journalctl -u $APP)."
-        return 1
+    if proxy_already_running "$_args"; then
+        msg "The DNS proxy is already running with this configuration."
+    else
+        svc_remove_unit
+        if _holders=$(port53_busy); then
+            err "Port 53 is already in use:"
+            printf '%s\n' "$_holders" >&2
+            die "Stop the service that holds port 53, or use --mode plain."
+        fi
+        msg "Starting the local DNS proxy on $PROXY_LISTEN:$PROXY_PORT ..."
+        if ! svc_install_and_start "$_args"; then
+            err "Failed to start the local DNS proxy (see: journalctl -u $APP)."
+            return 1
+        fi
+        if ! wait_proxy; then
+            warn "The DNS proxy did not answer within the timeout - the upstream may be blocked."
+            return 1
+        fi
     fi
-    if ! wait_proxy; then
-        warn "The DNS proxy did not answer within the timeout - the upstream may be blocked."
-        return 1
-    fi
-    if [ "$RESOLVER" = "resolved" ] && resolved_ensure_running; then
+    if [ "$BACKEND" = "resolved" ]; then
         resolved_write "$PROXY_LISTEN" "no" || return 1
     else
         nm_disable_management
         file_write_resolv "$PROXY_LISTEN" || return 1
     fi
+    APPLIED_VIA="proxy"
     return 0
 }
 
@@ -1204,16 +1509,46 @@ apply_dnscrypt() {
     return 0
 }
 
+# $1 = server to ask (empty for the system resolver), $2 = name, $3 = type
+# Prints the first address of the answer, or nothing.
+dig_answer() {
+    if have dig; then
+        if [ -n "$1" ]; then
+            dig +time="$VERIFY_TIMEOUT" +tries=1 +short "@$1" "$2" "$3" 2>/dev/null \
+                | grep -E '^[0-9]' | head -n1
+        else
+            dig +time="$VERIFY_TIMEOUT" +tries=1 +short "$2" "$3" 2>/dev/null \
+                | grep -E '^[0-9]' | head -n1
+        fi
+    elif have getent; then
+        getent ahostsv4 "$2" 2>/dev/null | awk 'NR==1{print $1}'
+    fi
+}
+
+# The local proxy is checked directly so that a stale cache in
+# systemd-resolved cannot hide a dead upstream.
 verify_resolution() {
     msg "Verifying name resolution ..."
+    have resolvectl && resolvectl flush-caches >/dev/null 2>&1
+    if [ "$APPLIED_VIA" = "proxy" ] && have dig; then
+        _tries=0
+        _ep_res=""
+        while [ "$_tries" -lt 6 ]; do
+            _ep_res=$(dig_answer "$PROXY_LISTEN" "$TEST_DOMAIN" A)
+            [ -n "$_ep_res" ] && break
+            _tries=$((_tries + 1))
+            sleep 1
+        done
+        if [ -z "$_ep_res" ]; then
+            warn "The local resolver at $PROXY_LISTEN did not answer for $TEST_DOMAIN."
+            return 1
+        fi
+        ok "Local resolver answers: $TEST_DOMAIN -> $_ep_res"
+    fi
     _tries=0
     _res=""
     while [ "$_tries" -lt 8 ]; do
-        if have dig; then
-            _res=$(dig +time=2 +tries=1 +short "$TEST_DOMAIN" A 2>/dev/null | grep -E '^[0-9]' | head -n1)
-        elif have getent; then
-            _res=$(getent ahostsv4 "$TEST_DOMAIN" 2>/dev/null | awk 'NR==1{print $1}')
-        fi
+        _res=$(dig_answer "" "$TEST_DOMAIN" A)
         [ -n "$_res" ] && break
         _tries=$((_tries + 1))
         sleep 1
@@ -1246,6 +1581,23 @@ apply_mode() {
         plain) : ;;
         *) service_supported || die "Encrypted DNS requires systemd or OpenRC. Plain DNS (--mode plain) still works." ;;
     esac
+    resolve_backend
+    if [ "$DRY_RUN" = "yes" ]; then
+        msg "Dry run - nothing will be changed."
+        msg "Backend : $BACKEND (requested: $BACKEND_REQ)"
+        msg "Target  : $(provider_label) via $(mode_label "$MODE")"
+        case "$MODE" in
+            plain)    apply_plain || return 1 ;;
+            dot)      apply_dot || return 1 ;;
+            doh)      apply_doh || return 1 ;;
+            doh3)     apply_doh3 || return 1 ;;
+            doq)      apply_doq || return 1 ;;
+            dnscrypt) apply_dnscrypt || return 1 ;;
+            *)        die "Unknown transport: $MODE" ;;
+        esac
+        ok "Dry run finished - nothing was changed."
+        return 0
+    fi
     snapshot_save || die "Cannot create the rollback snapshot."
     case "$MODE" in
         plain)    apply_plain || { snapshot_restore; return 1; } ;;
@@ -1266,7 +1618,7 @@ apply_mode() {
     fi
     SNAPSHOT_ACTIVE="no"
     snapshot_drop
-    ok "Done: $(provider_label) via $(mode_label "$MODE")"
+    ok "Done: $(provider_label) via $(mode_label "$MODE") (backend: $BACKEND)"
     return 0
 }
 
@@ -1507,6 +1859,14 @@ dnsproxy_path_display() {
     fi
 }
 
+backend_display() {
+    if [ "$RESOLVER" = "resolved" ] && have systemctl && resolved_stub_available; then
+        printf 'resolved'
+    else
+        printf 'file'
+    fi
+}
+
 show_status() {
     printf '\n%s\n' "${C_BOLD}${APP} ${APP_VERSION} - status${C_RESET}"
     printf '  Distribution : %s\n' "$OS_PRETTY"
@@ -1514,6 +1874,7 @@ show_status() {
     [ -n "$OS_LIKE" ] && printf '  ID_LIKE      : %s\n' "$OS_LIKE"
     printf '  Init system  : %s\n' "$INIT_SYS"
     printf '  Resolver     : %s\n' "$RESOLVER"
+    printf '  Backend      : %s (requested: %s)\n' "$(backend_display)" "$BACKEND_REQ"
     if [ "$HAS_IPV6" = "yes" ]; then
         printf '  IPv6         : yes\n'
     else
@@ -1543,24 +1904,135 @@ show_status() {
     printf '\n'
 }
 
+json_status() {
+    _m=$(state_get MODE)
+    _p=$(state_get PROVIDER_NAME)
+    _pr=$(state_get PROFILE)
+    _u=$(state_get UPDATED)
+    _managed="false"
+    [ -n "$_m" ] && _managed="true"
+    _svc="n/a"
+    if [ -f "$SYSTEMD_UNIT" ] && have systemctl; then
+        _svc=$(systemctl is-active "$APP" 2>/dev/null)
+        [ -n "$_svc" ] || _svc="inactive"
+    elif [ -f "$OPENRC_INIT" ]; then
+        _svc="openrc"
+    fi
+    _v6="false"
+    [ "$HAS_IPV6" = "yes" ] && _v6="true"
+    printf '{"app":"%s","version":"%s","managed":%s,"mode":"%s","provider":"%s","profile":"%s","backend":"%s","requested_backend":"%s","resolver":"%s","init":"%s","ipv6":%s,"service":"%s","dnsproxy":"%s","resolv_conf":"%s","updated":"%s"}\n' \
+        "$APP" "$APP_VERSION" "$_managed" "${_m:-}" "${_p:-}" "${_pr:-}" \
+        "$(backend_display)" "$BACKEND_REQ" "$RESOLVER" "$INIT_SYS" "$_v6" \
+        "$_svc" "$(dnsproxy_path_display)" "$RESOLV_CONF" "${_u:-}"
+}
+
+# Exit codes: 0 healthy, 1 unhealthy, 2 not managed by this script.
+health_check() {
+    _mode=$(state_get MODE)
+    _svc="n/a"
+    _managed="no"
+    if [ -f "$SYSTEMD_UNIT" ] && have systemctl; then
+        _managed="yes"
+        if systemctl is-active --quiet "$APP" 2>/dev/null; then
+            _svc="active"
+        else
+            _svc="inactive"
+        fi
+    elif [ -f "$OPENRC_INIT" ] && have rc-service; then
+        _managed="yes"
+        if rc-service "$APP" status >/dev/null 2>&1; then
+            _svc="active"
+        else
+            _svc="inactive"
+        fi
+    fi
+    _ep="n/a"
+    if { [ -f "$SYSTEMD_UNIT" ] || [ -f "$OPENRC_INIT" ]; } && have dig; then
+        if [ -n "$(dig_answer "$PROXY_LISTEN" "$TEST_DOMAIN" A)" ]; then
+            _ep="ok"
+        else
+            _ep="fail"
+        fi
+    fi
+    if have dig || have getent; then
+        if [ -n "$(dig_answer "" "$TEST_DOMAIN" A)" ]; then
+            _sys="ok"
+        else
+            _sys="fail"
+        fi
+    else
+        _sys="n/a"
+    fi
+    _rc=0
+    [ "$_svc" = "inactive" ] && _rc=1
+    [ "$_ep" = "fail" ] && _rc=1
+    [ "$_sys" = "fail" ] && _rc=1
+    [ "$_sys" = "n/a" ] && _rc=2
+    if [ "$_managed" = "no" ] && [ -z "$_mode" ]; then
+        _rc=2
+    fi
+    if [ "$DO_JSON" = "yes" ]; then
+        _managed_json="false"
+        [ "$_managed" = "yes" ] && _managed_json="true"
+        printf '{"app":"%s","health":%s,"managed":%s,"mode":"%s","service":"%s","endpoint":"%s","system":"%s"}\n' \
+            "$APP" "$( [ "$_rc" -eq 0 ] && printf 'true' || printf 'false' )" \
+            "$_managed_json" "${_mode:-}" "$_svc" "$_ep" "$_sys"
+    else
+        printf '  managed  : %s\n' "$_managed"
+        printf '  mode     : %s\n' "${_mode:-unknown}"
+        printf '  service  : %s\n' "$_svc"
+        printf '  endpoint : %s\n' "$_ep"
+        printf '  system   : %s\n' "$_sys"
+    fi
+    return "$_rc"
+}
+
 restore_all() {
     msg "Restoring the previous DNS configuration ..."
     svc_remove_unit
     resolved_clear
     nm_restore_management
     if [ -e "$RESOLV_BACKUP" ]; then
-        rm -f "$RESOLV_CONF"
-        cp -a "$RESOLV_BACKUP" "$RESOLV_CONF"
-        ok "Restored $RESOLV_CONF from $RESOLV_BACKUP"
+        if resolv_conf_writable; then
+            rm -f "$RESOLV_CONF"
+            cp -a "$RESOLV_BACKUP" "$RESOLV_CONF"
+            ok "Restored $RESOLV_CONF from $RESOLV_BACKUP"
+        else
+            warn "$RESOLV_CONF cannot be replaced (bind-mounted, read-only or immutable)."
+            warn "The saved copy is at $RESOLV_BACKUP."
+        fi
     elif [ -e "$BACKUP_DIR/resolv.conf.pre-resolved" ]; then
-        rm -f "$RESOLV_CONF"
-        cp -a "$BACKUP_DIR/resolv.conf.pre-resolved" "$RESOLV_CONF"
-        ok "Restored $RESOLV_CONF from the pre-resolved backup"
+        if resolv_conf_writable; then
+            rm -f "$RESOLV_CONF"
+            cp -a "$BACKUP_DIR/resolv.conf.pre-resolved" "$RESOLV_CONF"
+            ok "Restored $RESOLV_CONF from the pre-resolved backup"
+        else
+            warn "$RESOLV_CONF cannot be replaced (bind-mounted, read-only or immutable)."
+            warn "The saved copy is at $BACKUP_DIR/resolv.conf.pre-resolved."
+        fi
     else
         msg "No $RESOLV_CONF backup found - keeping the current file."
     fi
     rm -f "$STATE_FILE"
-    ok "System DNS defaults restored."
+    if verify_resolution >/dev/null 2>&1; then
+        ok "System DNS defaults restored."
+    else
+        warn "The files were restored, but name resolution still fails."
+        warn "Inspect $RESOLV_CONF and the resolver service manually."
+    fi
+}
+
+uninstall_all() {
+    restore_all
+    msg "Removing $STATE_DIR ..."
+    rm -rf "$STATE_DIR"
+    if [ "$PURGE" = "yes" ]; then
+        rm -f "$DNSPROXY_BIN"
+        ok "Removed $DNSPROXY_BIN"
+    else
+        msg "Kept $DNSPROXY_BIN (use --purge to remove it as well)."
+    fi
+    ok "$APP has been removed."
 }
 
 list_all() {
@@ -1856,11 +2328,20 @@ Options:
                         Profiles are shown by --list.
   -y, --yes             assume "yes", never ask for confirmation
       --apply           apply -m/-p without showing the menu (default for CLI)
+      --backend KIND    resolver backend: auto | resolved | file (default: auto)
+  -n, --dry-run         show what would change and exit (no root needed)
+      --force           restart the service even when the configuration is unchanged
+      --verify-timeout SEC
+                        per-query timeout of the post-apply DNS check (default: 2)
       --allow-unverified
                         install dnsproxy without verifying its sha256
       --list            list transports and providers
       --status          show the current configuration
+      --json            machine readable output for --status and --health
+      --health          exit 0 if DNS is healthy, 1 if not, 2 if not managed
       --restore         restore the system defaults
+      --uninstall       stop the service, restore the resolver, remove the state
+      --purge           with --uninstall: also remove /usr/local/bin/dnsproxy
       --test [KEY]      run a latency/stability test (optionally for a provider)
       --rank MODE       latency ranking of all providers for MODE
       --self-test       validate the built-in provider database (no changes)
@@ -1876,6 +2357,11 @@ Examples:
   $0 -m doh -p adguard:family --apply                  AdGuard family protection via DoH
   $0 -m dot -p cloudflare --apply                      set Cloudflare DoT
   $0 -m plain -p quad9 -y --apply                      plain Quad9, no prompts
+  $0 -m doh -p quad9 --dry-run                         show the plan, change nothing
+  $0 -m dot -p quad9 --backend file -y --apply         force the plain-file backend
+  $0 --status --json                                   machine readable status
+  $0 --health                                          monitoring exit code
+  $0 --uninstall                                       remove everything, keep dnsproxy
   $0 --test adguard
   $0 --rank doh
   $0 --status
@@ -1915,6 +2401,22 @@ parse_args() {
                 ;;
             -y|--yes)      ASSUME_YES="yes"; shift ;;
             --apply)       shift ;;
+            -n|--dry-run)  DRY_RUN="yes"; shift ;;
+            --force)       FORCE="yes"; shift ;;
+            --backend)
+                [ $# -ge 2 ] || die "Option $1 needs an argument"
+                BACKEND_REQ="$2"; shift 2 ;;
+            --verify-timeout)
+                [ $# -ge 2 ] || die "Option $1 needs an argument"
+                VERIFY_TIMEOUT="$2"
+                case "$VERIFY_TIMEOUT" in
+                    ''|*[!0-9]*|0) die "--verify-timeout needs a positive number of seconds" ;;
+                esac
+                shift 2 ;;
+            --json)        DO_JSON="yes"; shift ;;
+            --health)      DO_HEALTH=1; shift ;;
+            --uninstall)   DO_UNINSTALL=1; shift ;;
+            --purge)       PURGE="yes"; shift ;;
             --allow-unverified) ALLOW_UNVERIFIED="yes"; shift ;;
             --self-test)   DO_SELFTEST=1; shift ;;
             --list)        DO_LIST=1; shift ;;
@@ -1940,13 +2442,20 @@ parse_args() {
 
 main() {
     trap rollback_on_exit EXIT
+    # An interrupted apply must not leave a half-configured resolver behind:
+    # exiting runs the EXIT trap above, which restores the snapshot.
+    trap 'exit 130' INT TERM HUP
     parse_args "$@"
     detect_all
 
     # Read-only or unprivileged actions.
     if [ "$DO_SELFTEST" = "1" ]; then self_test; exit $?; fi
     if [ "$DO_LIST" = "1" ]; then list_all; exit 0; fi
-    if [ "$DO_STATUS" = "1" ]; then show_status; exit 0; fi
+    if [ "$DO_STATUS" = "1" ]; then
+        if [ "$DO_JSON" = "yes" ]; then json_status; else show_status; fi
+        exit 0
+    fi
+    if [ "$DO_HEALTH" = "1" ]; then health_check; exit $?; fi
     if [ -n "$DO_RANK" ]; then
         rank_providers "$DO_RANK" || exit 1
         exit 0
@@ -1962,7 +2471,21 @@ main() {
     fi
 
     # Actions that modify the system need root.
+    if [ "$DO_UNINSTALL" = "1" ]; then
+        if [ "$DRY_RUN" = "yes" ]; then
+            plan "would stop the service, restore the resolver and remove $STATE_DIR"
+            [ "$PURGE" = "yes" ] && plan "would remove $DNSPROXY_BIN"
+            exit 0
+        fi
+        require_root "$@"
+        uninstall_all
+        exit 0
+    fi
     if [ "$DO_RESTORE" = "1" ]; then
+        if [ "$DRY_RUN" = "yes" ]; then
+            plan "would stop the proxy service, remove its files and restore the resolver configuration"
+            exit 0
+        fi
         require_root "$@"
         restore_all
         exit 0
@@ -1971,9 +2494,12 @@ main() {
         [ -n "$MODE" ] || die "Please pass both --mode and --provider."
         [ -n "$P_KEY" ] || die "Please pass both --mode and --provider."
         validate_selection
-        require_root "$@"
+        [ "$DRY_RUN" = "yes" ] || require_root "$@"
         apply_mode || exit 1
         exit 0
+    fi
+    if [ "$DRY_RUN" = "yes" ]; then
+        die "--dry-run needs --mode and --provider."
     fi
 
     if [ ! -t 0 ]; then
