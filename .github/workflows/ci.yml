@@ -1,0 +1,38 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: POSIX syntax (dash)
+        run: |
+          dash -n dns-switcher.sh
+          dash -n tests/run.sh
+
+      - name: ShellCheck (errors only)
+        run: shellcheck -S error dns-switcher.sh tests/run.sh
+
+      - name: ShellCheck (advisory)
+        continue-on-error: true
+        run: shellcheck -S warning -e SC2086,SC2046 dns-switcher.sh tests/run.sh
+
+      - name: Tests on the runner (dash)
+        run: sh tests/run.sh
+
+      - name: Tests on Debian 12
+        run: docker run --rm -v "$PWD:/src" -w /src debian:12 sh tests/run.sh
+
+      - name: Tests on Alpine 3.20 (busybox)
+        run: docker run --rm -v "$PWD:/src" -w /src alpine:3.20 sh tests/run.sh
